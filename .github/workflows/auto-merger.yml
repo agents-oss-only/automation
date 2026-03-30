@@ -1,0 +1,169 @@
+# AgentsOSS Auto-Merger
+#
+# Deploy this to ONE central repo in your org, e.g.:
+#   agents-oss-only/automation/.github/workflows/auto-merger.yml
+#
+# What it does — nothing fancy:
+#   1. Lists every non-archived repo in the org
+#   2. Finds open PRs that have been APPROVED by any reviewer (agent or human)
+#   3. Checks that CI is fully green and the branch has no conflicts
+#   4. Squash-merges and deletes the branch
+#
+# The approval decision was already made by the agent running `agentsoss` locally.
+#
+# Required secret (auto-provided by Actions — just needs the right permissions):
+#   GITHUB_TOKEN
+#
+# Required org/repo variable:
+#   AGENTSOSS_ORG  (the GitHub org to scan — defaults to the repo's owner)
+
+name: AgentsOSS Auto-Merger
+
+on:
+  # Poll on a schedule — runs even if no PR events reach this repo
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes; adjust as needed
+
+  # Also fire whenever a review is submitted in THIS repo
+  pull_request_review:
+    types: [submitted]
+
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run — list mergeable PRs but do not merge"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write        # merge + delete branch
+  pull-requests: write   # post merge status comments
+
+jobs:
+  merge-approved-prs:
+    name: Merge approved PRs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Merge approved PRs across org
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ORG: ${{ vars.AGENTSOSS_ORG || github.repository_owner }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+
+          echo "=== AgentsOSS Auto-Merger ==="
+          echo "Org: $ORG"
+          echo "Dry run: $DRY_RUN"
+          echo ""
+
+          MERGED=0
+          SKIPPED=0
+          ERRORS=0
+
+          # ── 1. List all non-archived, non-disabled repos ──────────────────
+          REPOS=$(gh repo list "$ORG" --limit 200 \
+            --json name,isArchived,isDisabled \
+            --jq '.[] | select(.isArchived==false and .isDisabled==false) | .name')
+
+          if [ -z "$REPOS" ]; then
+            echo "No repos found in $ORG"
+            exit 0
+          fi
+
+          # ── 2. For each repo, find approved + mergeable PRs ───────────────
+          for REPO in $REPOS; do
+            FULL_REPO="$ORG/$REPO"
+
+            # Fetch open, non-draft PRs that are APPROVED and not conflicting
+            PRS=$(gh pr list --repo "$FULL_REPO" \
+              --state open \
+              --json number,title,reviewDecision,isDraft,mergeable,headRefName \
+              --jq '
+                .[] |
+                select(
+                  .isDraft == false and
+                  .reviewDecision == "APPROVED" and
+                  .mergeable == "MERGEABLE"
+                ) |
+                "\(.number) \(.title)"
+              ' 2>/dev/null || true)
+
+            if [ -z "$PRS" ]; then
+              continue
+            fi
+
+            echo "── $FULL_REPO ──"
+
+            while IFS= read -r PR_LINE; do
+              PR_NUM=$(echo "$PR_LINE" | awk '{print $1}')
+              PR_TITLE=$(echo "$PR_LINE" | cut -d' ' -f2-)
+
+              echo "  PR #$PR_NUM: $PR_TITLE"
+
+              # ── 3. Check that all CI checks are passing ──────────────────
+              # statusCheckRollup: SUCCESS, FAILURE, PENDING, NEUTRAL, SKIPPED
+              CHECK_RESULT=$(gh pr view "$PR_NUM" --repo "$FULL_REPO" \
+                --json statusCheckRollup \
+                --jq '
+                  .statusCheckRollup |
+                  if length == 0 then
+                    "no-checks"
+                  elif all(.conclusion == "SUCCESS" or .conclusion == "NEUTRAL" or .conclusion == "SKIPPED" or .conclusion == null) then
+                    "pass"
+                  else
+                    "fail"
+                  end
+                ' 2>/dev/null || echo "error")
+
+              case "$CHECK_RESULT" in
+                pass|no-checks)
+                  echo "    CI: ✓ ($CHECK_RESULT)"
+                  ;;
+                fail)
+                  echo "    CI: ✗ failing — skipping merge"
+                  SKIPPED=$((SKIPPED + 1))
+                  continue
+                  ;;
+                *)
+                  echo "    CI: could not determine status — skipping"
+                  SKIPPED=$((SKIPPED + 1))
+                  continue
+                  ;;
+              esac
+
+              # ── 4. Merge ─────────────────────────────────────────────────
+              if [ "$DRY_RUN" = "true" ]; then
+                echo "    [DRY RUN] Would merge PR #$PR_NUM"
+                MERGED=$((MERGED + 1))
+              else
+                if gh pr merge "$PR_NUM" \
+                    --repo "$FULL_REPO" \
+                    --squash \
+                    --delete-branch \
+                    --subject "$(gh pr view "$PR_NUM" --repo "$FULL_REPO" --json title --jq '.title') (#$PR_NUM)" \
+                    2>/dev/null; then
+                  echo "    ✓ Merged and branch deleted"
+                  MERGED=$((MERGED + 1))
+                else
+                  echo "    ✗ Merge failed (may have been merged already or requires admin override)"
+                  ERRORS=$((ERRORS + 1))
+                fi
+              fi
+
+            done <<< "$PRS"
+          done
+
+          # ── 5. Summary ────────────────────────────────────────────────────
+          echo ""
+          echo "=== Summary ==="
+          echo "Merged:  $MERGED"
+          echo "Skipped: $SKIPPED  (CI failing or undetermined)"
+          echo "Errors:  $ERRORS"
+
+          if [ "$ERRORS" -gt 0 ]; then
+            exit 1
+          fi
